@@ -5,8 +5,7 @@ import sys
 import openai
 import ast
 # APIキーの設定
-openai.api_key ='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'
-
+openai.api_key = ""
 def convert_to_typescript(python_code):
     response = openai.ChatCompletion.create(
         model="gpt-4",

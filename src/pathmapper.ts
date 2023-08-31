@@ -225,7 +225,10 @@ export class PathMapper {
   items(): [string, MapperEnt][] {
     return Object.entries(this._pathmap);
   }
-
+  contains(key: string) :boolean{
+   //Test for the presence of the given relative path in this mapper."""
+    return key in this._pathmap
+  }
   items_exclude_children(): [string, MapperEnt][] {
     const newitems: { [key: string]: MapperEnt } = {};
     const keys = this.items().map(([key, _]) => key);

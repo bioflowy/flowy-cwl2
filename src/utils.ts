@@ -9,6 +9,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { ValidationException, WorkflowException } from "./errors";
 import { CommandLineJob, JobBase } from "./job";
 import { MapperEnt, PathMapper } from "./pathmapper";
+import { CallbackJob, ExpressionJob } from "./command_line_tool";
 
 let __random_outdir: string | null = null;
 
@@ -39,7 +40,7 @@ export type CWLOutputAtomType =
 
 export type CWLObjectType = MutableMapping<CWLOutputType | undefined>;
 
-export type JobsType = CommandLineJob | JobBase // | WorkflowJob | ExpressionJob | CallbackJob;
+export type JobsType = CommandLineJob | JobBase | ExpressionJob | CallbackJob// | WorkflowJob  ;
 export type JobsGeneratorType = Generator<JobsType|undefined>;
 export type OutputCallbackType = (arg1:CWLObjectType, arg2:string) => void;
 // type ResolverType = (Loader, string)=>string?;
@@ -62,7 +63,7 @@ export type DirectoryType = {
 //         ['success', string]
 //     ]
 // >;
-export function isString(value: string) : value is string  { 
+export function isString(value: any) : value is string  { 
     return   typeof value === "string"
 }
 export function urldefrag(url: string): { url: string, fragment: string } {
@@ -259,14 +260,28 @@ function upgrade_lock(fd: any): void {
 //   }
 }
 
-function adjustFileObjs(rec: any, op: any): void {
+export function adjustFileObjs(rec: any, op: any): void {
   // apply update function to each File object in rec
   visit_class(rec, ["File"], op)
 }
 
-function adjustDirObjs(rec: any, op: any): void {
+export function adjustDirObjs(rec: any, op: any): void {
   // apply update function to each Directory object in rec
   visit_class(rec, ["Directory"], op)
+}
+const _find_unsafe = /[^a-zA-Z0-9@%+=:,./-]/;
+export function quote(s: string): string {
+    /** Return a shell-escaped version of the string *s*. */
+    if (!s) {
+        return "''";
+    }
+    if (!_find_unsafe.test(s)) {
+        return s;
+    }
+
+    // use single quotes, and put single quotes into double quotes
+    // the string $'b is then quoted as '$'"'"'b'
+    return `'${s.replace(/'/g, "'\"'\"'")}'`;
 }
 
 export function dedup(listing: any[]): any[] {
@@ -515,7 +530,7 @@ export function ensure_non_writable(targetPath: string): void {
         removeWritableFlag(targetPath);
     }
 }
-function splitext(p: string): [string, string] {
+export function splitext(p: string): [string, string] {
     const ext = path.extname(p);
     const base = p.substring(0, p.length - ext.length);
     return [base, ext];

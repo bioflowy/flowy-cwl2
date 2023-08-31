@@ -1,23 +1,17 @@
 
-import {MpiConfig} from './mpi';
-import {PathMapper} from './pathmapper';
+import {PathMapper} from './pathmapper'
 import {StdFsAccess} from './stdfsaccess';
-import {DEFAULT_TMP_PREFIX, CWLObjectType, HasReqsHints, ResolverType, mkdtemp, CommentedMap} from './utils';
+import {DEFAULT_TMP_PREFIX, CWLObjectType, HasReqsHints,  mkdtemp, CommentedMap} from './utils';
 
-import { Builder } from './builder';
-import { ResearchObject } from './cwlprov.ro';
-import { MutationManager } from './mutation';
-import { Process } from './process';
-import { SecretStore } from './secrets';
-import { DependenciesConfiguration } from './software_requirements';
+import { Builder } from './builder'
+import { Process } from './process'
 
-import { LoadingOptions } from 'cwl_utils.parser.cwl_v1_2';
 class ContextBase {
     constructor(kwargs: { [key: string]: any } | null = null) {
         if (kwargs) {
             for (let [k, v] of Object.entries(kwargs)) {
                 if (this.hasOwnProperty(k)) {
-                    this[k] = v;
+                    (this as any)[k] = v;
                 }
             }
         }
@@ -34,11 +28,11 @@ function log_handler(outdir: string, base_path_logs: string, stdout_path: string
     if (outdir != base_path_logs) {
         if (stdout_path) {
             let new_stdout_path = stdout_path.replace(base_path_logs, outdir);
-            shutil.copy2(stdout_path, new_stdout_path);
+//            shutil.copy2(stdout_path, new_stdout_path);
         }
         if (stderr_path) {
             let new_stderr_path = stderr_path.replace(base_path_logs, outdir);
-            shutil.copy2(stderr_path, new_stderr_path);
+  //          shutil.copy2(stderr_path, new_stderr_path);
         }
     }
 }
@@ -56,17 +50,12 @@ export class LoadingContext extends ContextBase {
     metadata: CWLObjectType = {};
     requirements: Array<CWLObjectType> | null = null;
     hints: Array<CWLObjectType> | null = null;
-    loader: Loader | null = null;
-    avsc_names: Names | null = null;
     disable_js_validation: boolean = false;
     js_hint_options_file: string | null = null;
     do_validate: boolean = true;
     enable_dev: boolean = false;
     strict: boolean = true;
-    resolver: ResolverType | null = null;
-    fetcher_constructor: FetcherCallableType | null = null;
     construct_tool_object = default_make_tool;
-    research_obj: ResearchObject | null = null;
     orcid: string = "";
     cwl_full_name: string = "";
     host_provenance: boolean = false;
@@ -79,7 +68,6 @@ export class LoadingContext extends ContextBase {
     singularity: boolean = false;
     podman: boolean = false;
     eval_timeout: number = 60;
-    codegen_idx: Map<string, [any, LoadingOptions]> = new Map();
     fast_parser: boolean = false;
     skip_resolve_all: boolean = false;
     skip_schemas: boolean = false;
@@ -152,7 +140,6 @@ export class RuntimeContext extends ContextBase {
     cwl_full_name: string = "";
     process_run_id?: string = undefined;
     prov_obj?: any = undefined;
-    mpi_config: any = new MpiConfig();
     default_stdout?: any = undefined;
     default_stderr?: any = undefined;
 

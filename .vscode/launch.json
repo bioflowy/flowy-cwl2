@@ -12,6 +12,18 @@
             "console": "integratedTerminal",
             "justMyCode": true,
             "args": ["pathmapper.py"]
-        }
+        },
+        {
+            "name": "bwa-mem-tool",
+            "type": "node",
+            "request": "launch",
+            "program": "src/main.ts",
+            "console": "integratedTerminal",
+            "preLaunchTask": "tsc: build - tsconfig.json",
+            "outFiles": [
+                "${workspaceFolder}/dist/**/*.js"
+              ],
+            "args": ["tests/bwa-mem-tool.cwl"]
+        },
     ]
 }

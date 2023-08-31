@@ -7,6 +7,7 @@ import {
     CONTENT_LIMIT, CWLObjectType, CWLOutputType, 
     CommentedMap, HasReqsHints, MutableMapping, MutableSequence, aslist,
      get_listing, isString, normalizeFilesDirs, visit_class } from './utils';
+import { PathMapper } from './pathmapper';
 
 const INPUT_OBJ_VOCAB: { [key: string]: string } = {
     "Any": "https://w3id.org/cwl/salad#Any",
@@ -28,7 +29,8 @@ export function contentLimitRespectedRead(f: fs.ReadStream): string {
     return contentLimitRespectedReadBytes(f).toString("utf-8");
 }
 
-function substitute(value: string, replace: string): string {
+
+export function substitute(value: string, replace: string): string {
     if (replace.startsWith("^")) {
         try {
             return substitute(value.substring(0, value.lastIndexOf(".")), replace.substring(1));
@@ -63,7 +65,7 @@ export class Builder extends HasReqsHints {
     stagedir: string;
     cwlVersion: string;
     container_engine: string;
-    pathmapper: any | null;
+    pathmapper: PathMapper | null;
     prov_obj: any | null;
     find_default_container: any | null;
 
@@ -385,6 +387,7 @@ bind_input(
         sf_schema = aslist(schema["secondaryFiles"]);
     }
 
+    let sf_required = true
     for (let [num, sf_entry] of sf_schema.entries()) {
         if ("required" in sf_entry && sf_entry["required"] !== null) {
         const required_result = this.do_eval(sf_entry["required"], {context: datum});
@@ -399,9 +402,7 @@ bind_input(
             `The result of a expression in the field 'required' must be a bool or None, not a ${typeof required_result}. Expression ${sf_entry['required']} resulted in ${required_result}.`
             );
         }
-        var sf_required = required_result;
-        } else {
-        var sf_required = true;
+            sf_required = required_result as boolean;
         }
 
         let sfpath: any;

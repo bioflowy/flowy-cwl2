@@ -3,6 +3,7 @@
  */
 import * as fs from 'fs'
 import * as path from 'path'
+import {createHash} from 'crypto';
 import fsExtra from 'fs-extra';
 import {
     Builder
@@ -145,7 +146,7 @@ let SCHEMA_ANY;
 // }
 
 
-function shortname(inputid: string): string {
+export function shortname(inputid: string): string {
     const parsedUrl = new URL(inputid);
 
     if (parsedUrl.hash) {
@@ -391,7 +392,7 @@ function eval_resource(
             );
         }
         if (typeof result === 'string' || typeof result === 'number' || result === null) {
-            return result;
+            return result as string | number | null;
         }
         throw new WorkflowException(
             `Got incorrect return type ${typeof result} from resource expression evaluation of ${resource_req}.`
@@ -469,8 +470,8 @@ export abstract class Process extends HasReqsHints {
         this.hints = this.hints.concat(tool_hints);
         this.original_requirements = copy.deepcopy(this.requirements);
         this.original_hints = copy.deepcopy(this.hints);
-        this.doc_loader = loadingContext.loader;
-        this.doc_schema = loadingContext.avsc_names;
+        // this.doc_loader = loadingContext.loader;
+        // this.doc_schema = loadingContext.avsc_names;
         this.formatgraph = null;
 
         if (this.doc_loader !== null) {
@@ -479,7 +480,7 @@ export abstract class Process extends HasReqsHints {
 
         this.checkRequirements(this.tool as any, supportedProcessRequirements);
         this.validate_hints(
-            loadingContext.avsc_names,
+            undefined,
             this.tool["hints"] || [],
             getDefault(loadingContext.strict, false)
         );
@@ -884,7 +885,7 @@ toString(): string {
 }
 }
 const _names: Set<string> = new Set();
-function uniquename(stem: string, names?: Set<string>): string {
+export function uniquename(stem: string, names?: Set<string>): string {
     if (!names) {
         names = _names;
     }
@@ -1143,19 +1144,30 @@ export function scandeps(
   
       return r;
   }
- function compute_checksums(fs_access: StdFsAccess, fileobj: CWLObjectType): void{
+  function calculateSHA1(filePath: string): Promise<string> {
+    return new Promise((resolve, reject) => {
+        const hash = createHash('sha1');
+        const stream = fs.createReadStream(filePath);
+
+        stream.on('data', chunk => {
+            hash.update(chunk);
+        });
+
+        stream.on('end', () => {
+            resolve(hash.digest('hex'));
+        });
+
+        stream.on('error', err => {
+            reject(err);
+        });
+    });
+}
+export async function compute_checksums(fs_access: StdFsAccess, fileobj: CWLObjectType): Promise<void>{
     // TODO
-    // if (!("checksum" in fileobj)) {
-    //     const checksum = hashlib.sha1();
-    //     const location = fileobj["location"] as string;
-    //     fs_access.open(location, "rb", (f) => {
-    //         let contents = f.read(1024 * 1024);
-    //         while (contents !== "") {
-    //             checksum.update(contents);
-    //             contents = f.read(1024 * 1024);
-    //         }
-    //     });
-    //     fileobj["checksum"] = `sha1$${checksum.hexdigest()}`;
-    //     fileobj["size"] = fs_access.size(location);
-    // }
+    if (!("checksum" in fileobj)) {
+        const location = fileobj["location"] as string;
+        const hash = await createHash(location)
+        fileobj["checksum"] = `sha1$${hash}`;
+        fileobj["size"] = fs_access.size(location);
+    }
 }

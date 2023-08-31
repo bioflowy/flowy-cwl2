@@ -1,13 +1,13 @@
-import { Builder } from "./builder";
+import { Builder, contentLimitRespectedRead, substitute } from "./builder";
 import * as path from 'path'
 import * as fs from 'fs'
-import { LoadingContext, RuntimeContext } from "./context";
-import { UnsupportedRequirement, WorkflowException } from "./errors";
+import { LoadingContext, RuntimeContext, getDefault } from "./context";
+import { UnsupportedRequirement, ValidationException, WorkflowException } from "./errors";
 import { _logger } from "./loghandler";
 import { PathMapper } from "./pathmapper";
-import { Process } from "./process";
+import { Process, compute_checksums, shortname, uniquename } from "./process";
 import { StdFsAccess } from "./stdfsaccess";
-import { CWLObjectType, CWLOutputType, JobsGeneratorType, OutputCallbackType, fileUri, normalizeFilesDirs, uriFilePath, visit_class } from "./utils";
+import { CWLObjectType, CWLOutputType, JobsGeneratorType, MutableMapping, OutputCallbackType, adjustDirObjs, adjustFileObjs, aslist, fileUri, get_listing, isString, normalizeFilesDirs, quote, splitext, uriFilePath, visit_class } from "./utils";
 import { CommandLineJob, JobBase } from "./job";
 import * as cwlTsAuto from 'cwl-ts-auto'
 import { DockerCommandLineJob, PodmanCommandLineJob } from "./docker";
@@ -17,7 +17,7 @@ class PathCheckingMode {
     static RELAXED: RegExp = new RegExp(".*");
     
 }
-class ExpressionJob {
+export class ExpressionJob {
     builder: Builder;
     script: string;
     output_callback: OutputCallbackType | null;
@@ -71,14 +71,14 @@ class ExpressionJob {
         }
     }
 }
-class ExpressionTool extends Process {
+export class ExpressionTool extends Process {
     tool:cwlTsAuto.ExpressionTool
     constructor(tool:cwlTsAuto.ExpressionTool,loadingContext:LoadingContext){
         super(tool,loadingContext)
-        tool.requirements
+        this.tool = tool
     }
     *job(job_order: CWLObjectType, output_callbacks: OutputCallbackType | null, runtimeContext: RuntimeContext):
-        Generator<ExpressionJob> {
+        JobsGeneratorType {
         const builder = this._init_job(job_order, runtimeContext);
         const job = new ExpressionJob(
             builder,
@@ -150,7 +150,7 @@ function revmap_file(builder: Builder, outdir: string, f: CWLObjectType): CWLObj
     }
     throw new WorkflowException(`Output File object is missing both 'location' and 'path' fields: ${f}`);
 }
-class CallbackJob {
+export class CallbackJob {
     job: any;
     output_callback: any | null;
     cachebuilder: any;
@@ -183,7 +183,7 @@ function checkAdjust(acceptRe: any, builder: Builder, fileO: CWLObjectType): CWL
     if (!builder.pathmapper) {
         throw new Error("Do not call check_adjust using a builder that doesn't have a pathmapper.");
     }
-    const path1 = builder.pathmapper.mapper(fileO["location"])[1];
+    const path1 = builder.pathmapper.mapper(fileO["location"] as string).target;
     fileO["path"] = path1
     let basename = fileO["basename"];
     let dn = path.dirname(path1)
@@ -227,7 +227,7 @@ function checkValidLocations(fsAccess: StdFsAccess, ob: CWLObjectType): void {
 }
 
 interface OutputPortsType {
-    [key: string]: CWLOutputType | null;
+    [key: string]: CWLOutputType | undefined;
 }
 
 class ParameterOutputWorkflowException extends WorkflowException {
@@ -322,7 +322,7 @@ export class CommandLineTool extends Process {
         let basename = fn["basename"] as string;
         if ("location" in fn) {
             let location = fn["location"] as string;
-            if (pathmap[location]) {
+            if (pathmap.contains(location)) {
                 pathmap.update(
                     location,
                     pathmap.mapper(location).resolved,
@@ -431,7 +431,7 @@ export class CommandLineTool extends Process {
                     } else {
                         if (classic_dirent) {
                             throw new WorkflowException(
-                                `'entry' expression resulted in something other than number, object or array besides a single File or Dirent object. In CWL v1.2+ this would be serialized to a JSON object. However this is a ${cwl_version} document. If that is the desired result then please consider using 'cwl-upgrader' to upgrade your document to CWL version 1.2. Result of ${entry_field} was ${entry}.`
+                                `'entry' expression resulted in something other than number, object or array besides a single File or Dirent object. In CWL v1.2+ this would be serialized to a JSON object. However this is a document. If that is the desired result then please consider using 'cwl-upgrader' to upgrade your document to CWL version 1.2. Result of ${entry_field} was ${entry}.`
                             );
                         }
                         et["entry"] = JSON.stringify(entry, null, "");
@@ -462,7 +462,7 @@ export class CommandLineTool extends Process {
                 if (!initwd_item) {
                     continue;
                 }
-                if (this.isInstanceOf(initwd_item, Array<string | CWLObjectType>)) {
+                if (initwd_item instanceof Array) {
                     ls.push(...initwd_item as Array<CWLObjectType>);
                 } else {
                     ls.push(initwd_item as CWLObjectType);
@@ -533,7 +533,7 @@ export class CommandLineTool extends Process {
                     `Directory object, was ${t3}.`);
             }
             if (!("basename" in t3)) continue;
-            const basename = path.normpath(t3["basename"] as string);
+            const basename = path.normalize(t3["basename"] as string);
             t3["basename"] = basename;
             if (basename.startsWith("../")) {
                 throw new WorkflowException(
@@ -588,323 +588,319 @@ export class CommandLineTool extends Process {
             visit_class(
                 [builder.files, builder.bindings],
                 ["File", "Directory"],
-                (val)=>(_check_adjust(this.path_check_mode.value, builder,val)
-            )
-        }
-}
-
-_initialworkdir(j: JobBase, builder: Builder): void {
-    let [initialWorkdir,_] = this.get_requirement("InitialWorkDirRequirement");
-    if (initialWorkdir == undefined) {
-        return;
-    }
-    let debug = _logger.isDebugEnabled()
-    let classic_dirent = false
-    let classic_listing = false
-
-    let ls: CWLObjectType[] = [];
-    if (typeof initialWorkdir["listing"] == 'string') {
-        ls = this.evaluate_listing_string(initialWorkdir, builder, classic_dirent, classic_listing, debug);
-    } else {
-        ls = this.evaluate_listing_expr_or_dirent(initialWorkdir, builder, classic_dirent, classic_listing, debug);
-    }
-
-    this.check_output_items(initialWorkdir, ls, debug);
-
-    this.check_output_items2(initialWorkdir, ls, cwl_version, debug);
-
-    j.generatefiles["listing"] = ls;
-    this.setup_output_items(initialWorkdir,builder,  ls, debug);
-}
-cache_context() {
-    let cachecontext = runtimeContext.copy();
-    cachecontext.outdir = "/out";
-    cachecontext.tmpdir = "/tmp"; // nosec
-    cachecontext.stagedir = "/stage";
-    let cachebuilder = this._init_job(job_order, cachecontext);
-    cachebuilder.pathmapper = new PathMapper(
-        cachebuilder.files,
-        runtimeContext.basedir,
-        cachebuilder.stagedir,
-        { separateDirs: false }
-    );
-    let _check_adjust = partial(check_adjust, this.path_check_mode.value, cachebuilder);
-    let _checksum = partial(
-        compute_checksums,
-        runtimeContext.make_fs_access(runtimeContext.basedir),
-    );
-    visit_class(
-        [cachebuilder.files, cachebuilder.bindings],
-        ("File", "Directory"),
-        _check_adjust,
-    );
-    visit_class([cachebuilder.files, cachebuilder.bindings], ("File"), _checksum);
-
-    let cmdline = flatten(list(map(cachebuilder.generate_arg, cachebuilder.bindings)));
-    let [docker_req, ] = this.get_requirement("DockerRequirement");
-    let dockerimg;
-    if (docker_req !== null && runtimeContext.use_container) {
-        dockerimg = docker_req.get("dockerImageId") || docker_req.get("dockerPull");
-    } else if (runtimeContext.default_container !== null && runtimeContext.use_container) {
-        dockerimg = runtimeContext.default_container;
-    } else {
-        dockerimg = null;
-    }
-
-    if (dockerimg !== null) {
-        cmdline = ["docker", "run", dockerimg].concat(cmdline);
-        // not really run using docker, just for hashing purposes
-    }
-
-    let keydict: { [key: string]: any } = {
-        "cmdline": cmdline
-    };
-
-    for (let shortcut of ["stdin", "stdout", "stderr"]) {
-        if (shortcut in this.tool) {
-            keydict[shortcut] = this.tool[shortcut];
+                (val)=>(checkAdjust(this.path_check_mode.value, builder,val)
+            ))
         }
     }
 
-    let calc_checksum = (location: string): Optional<string> => {
-        for (let e of cachebuilder.files) {
-            if (
-                "location" in e &&
-                e["location"] === location &&
-                "checksum" in e &&
-                e["checksum"] != "sha1$hash"
-            ) {
-                return cast(Optional[str], e["checksum"]);
-            }
+    _initialworkdir(j: JobBase, builder: Builder): void {
+        let [initialWorkdir,_] = this.get_requirement("InitialWorkDirRequirement");
+        if (initialWorkdir == undefined) {
+            return;
         }
-        return null;
-    }
+        let debug = _logger.isDebugEnabled()
+        let classic_dirent = false
+        let classic_listing = false
 
-    let remove_prefix = (s: string, prefix: string): string => {
-        return s.startsWith(prefix) ? s.slice(prefix.length) : s;
-    }
-
-    for (let [location, fobj] of Object.entries(cachebuilder.pathmapper)) {
-        if (fobj.type === "File") {
-            let checksum = calc_checksum(location);
-            let fobj_stat = os.stat(fobj.resolved);
-            let path = remove_prefix(fobj.resolved, runtimeContext.basedir + "/");
-            if (checksum !== null) {
-                keydict[path] = [fobj_stat.st_size, checksum];
-            } else {
-                keydict[path] = [
-                    fobj_stat.st_size,
-                    Math.round(fobj_stat.st_mtime * 1000),
-                ];
-            }
-        }
-    }
-
-    let interesting = new Set([
-        "DockerRequirement",
-        "EnvVarRequirement",
-        "InitialWorkDirRequirement",
-        "ShellCommandRequirement",
-        "NetworkAccess",
-    ]);
-    for (let rh of [this.original_requirements, this.original_hints]) {
-        for (let r of rh.slice().reverse()) {
-            let cls = cast(str, r["class"]);
-            if (interesting.has(cls) && !(cls in keydict)) {
-                keydict[cls] = r;
-            }
-        }
-    }
-
-    let keydictstr = json_dumps(keydict, { separators: (",", ":"), sort_keys: true });
-    let cachekey = hashlib.md5(keydictstr.encode("utf-8")).hexdigest(); // nosec
-
-    _logger.debug(`[job ${jobname}] keydictstr is ${keydictstr} -> ${cachekey}`);
-
-    let jobcache = os.path.join(runtimeContext.cachedir, cachekey);
-
-    // Create a lockfile to manage cache status.
-    let jobcachepending = `${jobcache}.status`;
-    let jobcachelock = null;
-    let jobstatus = null;
-
-    // Opens the file for read/write, or creates an empty file.
-    jobcachelock = open(jobcachepending, "a+");
-
-    // get the shared lock to ensure no other process is trying
-    // to write to this cache
-    shared_file_lock(jobcachelock);
-    jobcachelock.seek(0);
-    jobstatus = jobcachelock.read();
-
-    if (os.path.isdir(jobcache) && jobstatus === "success") {
-        if (docker_req && runtimeContext.use_container) {
-            cachebuilder.outdir = runtimeContext.docker_outdir || random_outdir();
+        let ls: CWLObjectType[] = [];
+        if (typeof initialWorkdir["listing"] == 'string') {
+            ls = this.evaluate_listing_string(initialWorkdir, builder, classic_dirent, classic_listing, debug);
         } else {
-            cachebuilder.outdir = jobcache;
+            ls = this.evaluate_listing_expr_or_dirent(initialWorkdir, builder, classic_dirent, classic_listing, debug);
         }
 
-        _logger.info(`[job ${jobname}] Using cached output in ${jobcache}`);
-        yield new CallbackJob(this, output_callbacks, cachebuilder, jobcache);
-        // we're done with the cache so release lock
-        jobcachelock.close();
-        return null;
-    } else {
-        _logger.info(`[job ${jobname}] Output of job will be cached in ${jobcache}`);
+        this.check_output_items(initialWorkdir, ls, debug);
 
-        // turn shared lock into an exclusive lock since we'll
-        // be writing the cache directory
-        upgrade_lock(jobcachelock);
+        this.check_output_items2(initialWorkdir, ls, "cwl_version", debug);
 
-        shutil.rmtree(jobcache, true);
-        fs.makedir(jobcache);
-        runtimeContext = runtimeContext.copy();
-        runtimeContext.outdir = jobcache;
-
-        let update_status_output_callback = (
-            output_callbacks: OutputCallbackType,
-            jobcachelock: TextIO,
-            outputs: Optional[CWLObjectType],
-            processStatus: string,
-        ) => {
-            // save status to the lockfile then release the lock
-            jobcachelock.seek(0);
-            jobcachelock.truncate();
-            jobcachelock.write(processStatus);
-            jobcachelock.close();
-            output_callbacks(outputs, processStatus);
-        }
-
-        output_callbacks = partial(
-            update_status_output_callback, output_callbacks, jobcachelock
-        );
-        return output_callbacks;
+        j.generatefiles["listing"] = ls;
+        this.setup_output_items(initialWorkdir,builder,  ls, debug);
     }
-}
+    cache_context(runtimeContext:RuntimeContext) {
+        // TODO cache not implemented
+        // let cachecontext = runtimeContext.copy();
+        // cachecontext.outdir = "/out";
+        // cachecontext.tmpdir = "/tmp"; // nosec
+        // cachecontext.stagedir = "/stage";
+        // let cachebuilder = this._init_job(job_order, cachecontext);
+        // cachebuilder.pathmapper = new PathMapper(
+        //     cachebuilder.files,
+        //     runtimeContext.basedir,
+        //     cachebuilder.stagedir,
+        //     false 
+        // );
+        // let _check_adjust = partial(check_adjust, this.path_check_mode.value, cachebuilder);
+        // let _checksum = partial(
+        //     compute_checksums,
+        //     runtimeContext.make_fs_access(runtimeContext.basedir),
+        // );
+        // visit_class(
+        //     [cachebuilder.files, cachebuilder.bindings],
+        //     ["File", "Directory"],
+        //     _check_adjust,
+        // );
+        // visit_class([cachebuilder.files, cachebuilder.bindings], ["File"], _checksum);
+
+        // let cmdline = flatten(list(map(cachebuilder.generate_arg, cachebuilder.bindings)));
+        // let [docker_req, ] = this.get_requirement("DockerRequirement");
+        // let dockerimg;
+        // if (docker_req !== undefined && runtimeContext.use_container) {
+        //     dockerimg = docker_req["dockerImageId"] || docker_req["dockerPull"];
+        // } else if (runtimeContext.default_container !== null && runtimeContext.use_container) {
+        //     dockerimg = runtimeContext.default_container;
+        // } else {
+        //     dockerimg = null;
+        // }
+
+        // if (dockerimg !== null) {
+        //     cmdline = ["docker", "run", dockerimg].concat(cmdline);
+        //     // not really run using docker, just for hashing purposes
+        // }
+
+        // let keydict: { [key: string]: any } = {
+        //     "cmdline": cmdline
+        // };
+
+        // for (let shortcut of ["stdin", "stdout", "stderr"]) {
+        //     if (shortcut in this.tool) {
+        //         keydict[shortcut] = this.tool[shortcut];
+        //     }
+        // }
+
+        // let calc_checksum = (location: string): string | undefined => {
+        //     for (let e of cachebuilder.files) {
+        //         if (
+        //             "location" in e &&
+        //             e["location"] === location &&
+        //             "checksum" in e &&
+        //             e["checksum"] != "sha1$hash"
+        //         ) {
+        //             return e["checksum"] as string;
+        //         }
+        //     }
+        //     return undefined;
+        // }
+
+        // let remove_prefix = (s: string, prefix: string): string => {
+        //     return s.startsWith(prefix) ? s.slice(prefix.length) : s;
+        // }
+
+        // for (let [location, fobj] of Object.entries(cachebuilder.pathmapper)) {
+        //     if (fobj.type === "File") {
+        //         let checksum = calc_checksum(location);
+        //         let fobj_stat = fs.statSync(fobj.resolved);
+        //         let path = remove_prefix(fobj.resolved, runtimeContext.basedir + "/");
+        //         if (checksum !== null) {
+        //             keydict[path] = [fobj_stat.size, checksum];
+        //         } else {
+        //             keydict[path] = [
+        //                 fobj_stat.size,
+        //                 Math.round(fobj_stat.mtimeMs),
+        //             ];
+        //         }
+        //     }
+        // }
+
+        // let interesting = new Set([
+        //     "DockerRequirement",
+        //     "EnvVarRequirement",
+        //     "InitialWorkDirRequirement",
+        //     "ShellCommandRequirement",
+        //     "NetworkAccess",
+        // ]);
+        // for (let rh of [this.original_requirements, this.original_hints]) {
+        //     for (let r of rh.slice().reverse()) {
+        //         let cls = r["class"] as string
+        //         if (interesting.has(cls) && !(cls in keydict)) {
+        //             keydict[cls] = r;
+        //         }
+        //     }
+        // }
+
+        // let keydictstr = json_dumps(keydict, { separators: (",", ":"), sort_keys: true });
+        // let cachekey = hashlib.md5(keydictstr.encode("utf-8")).hexdigest(); // nosec
+
+        // _logger.debug(`[job ${jobname}] keydictstr is ${keydictstr} -> ${cachekey}`);
+
+        // let jobcache = path.join(runtimeContext.cachedir, cachekey);
+
+        // // Create a lockfile to manage cache status.
+        // let jobcachepending = `${jobcache}.status`;
+        // let jobcachelock = null;
+        // let jobstatus = null;
+
+        // // Opens the file for read/write, or creates an empty file.
+        // jobcachelock = open(jobcachepending, "a+");
+
+        // // get the shared lock to ensure no other process is trying
+        // // to write to this cache
+        // shared_file_lock(jobcachelock);
+        // jobcachelock.seek(0);
+        // jobstatus = jobcachelock.read();
+
+        // if (os.path.isdir(jobcache) && jobstatus === "success") {
+        //     if (docker_req && runtimeContext.use_container) {
+        //         cachebuilder.outdir = runtimeContext.docker_outdir || random_outdir();
+        //     } else {
+        //         cachebuilder.outdir = jobcache;
+        //     }
+
+        //     _logger.info(`[job ${jobname}] Using cached output in ${jobcache}`);
+        //     yield new CallbackJob(this, output_callbacks, cachebuilder, jobcache);
+        //     // we're done with the cache so release lock
+        //     jobcachelock.close();
+        //     return null;
+        // } else {
+        //     _logger.info(`[job ${jobname}] Output of job will be cached in ${jobcache}`);
+
+        //     // turn shared lock into an exclusive lock since we'll
+        //     // be writing the cache directory
+        //     upgrade_lock(jobcachelock);
+
+        //     shutil.rmtree(jobcache, true);
+        //     fs.makedir(jobcache);
+        //     runtimeContext = runtimeContext.copy();
+        //     runtimeContext.outdir = jobcache;
+
+        //     let update_status_output_callback = (
+        //         output_callbacks: OutputCallbackType,
+        //         jobcachelock: TextIO,
+        //         outputs: Optional[CWLObjectType],
+        //         processStatus: string,
+        //     ) => {
+        //         // save status to the lockfile then release the lock
+        //         jobcachelock.seek(0);
+        //         jobcachelock.truncate();
+        //         jobcachelock.write(processStatus);
+        //         jobcachelock.close();
+        //         output_callbacks(outputs, processStatus);
+        //     }
+
+        //     output_callbacks = partial(
+        //         update_status_output_callback, output_callbacks, jobcachelock
+        //     );
+        //     return output_callbacks;
+        // }
+    }
 handle_tool_time_limit(builder: Builder, j: JobBase, debug: boolean): void {
-    let timelimit;
-    [timelimit, _] = this.get_requirement("ToolTimeLimit");
+    const [timelimit, _] = this.get_requirement("ToolTimeLimit");
     if (timelimit == null) {
         return;
     }
-    with (new SourceLine(timelimit, "timelimit", ValidationException, debug)) {
 
-        let limit_field = (<{ [key: string]: string | number }>timelimit)["timelimit"];
-        if (typeof limit_field === "string") {
-            let timelimit_eval = builder.do_eval(limit_field);
-            if (timelimit_eval && typeof timelimit_eval !== "number") {
-                throw new WorkflowException(
-                    `'timelimit' expression must evaluate to a long/int. Got 
-                    ${timelimit_eval!r} for expression ${limit_field!r}.`
-                )
-            } else {
-                let timelimit_eval = limit_field;
-            }
-            if (typeof timelimit_eval !== "number" || timelimit_eval < 0) {
-                throw new WorkflowException(
-                    `timelimit must be an integer >= 0, got: ${timelimit_eval!r}`
-                )
-            }
-            j.timelimit = timelimit_eval;
+    let limit_field = (<{ [key: string]: string | number }>timelimit)["timelimit"];
+    if (typeof limit_field === "string") {
+        let timelimit_eval = builder.do_eval(limit_field);
+        if (timelimit_eval && typeof timelimit_eval !== "number") {
+            throw new WorkflowException(
+                `'timelimit' expression must evaluate to a long/int. Got 
+                ${timelimit_eval} for expression ${limit_field}.`
+            )
+        } else {
+            let timelimit_eval = limit_field;
         }
+        if (typeof timelimit_eval !== "number" || timelimit_eval < 0) {
+            throw new WorkflowException(
+                `timelimit must be an integer >= 0, got: ${timelimit_eval}`
+            )
+        }
+        j.timelimit = timelimit_eval;
     }
 }
 
 handle_network_access(builder: Builder, j: JobBase, debug: boolean): void {
-    let networkaccess;
-    [networkaccess, _] = this.get_requirement("NetworkAccess");
+    const [networkaccess, _] = this.get_requirement("NetworkAccess");
     if (networkaccess == null) {
         return;
     }
-    with (new SourceLine(networkaccess, "networkAccess", ValidationException, debug)) {
-        let networkaccess_field = networkaccess["networkAccess"];
-        if (typeof networkaccess_field === "string") {
-            let networkaccess_eval = builder.do_eval(networkaccess_field);
-            if (typeof networkaccess_eval !== "boolean") {
-                throw new WorkflowException(
-                    `'networkAccess' expression must evaluate to a bool. 
-                    Got ${networkaccess_eval!r} for expression ${networkaccess_field!r}.`
-                )
-            } else {
-                let networkaccess_eval = networkaccess_field;
-            }
-            if (typeof networkaccess_eval !== "boolean") {
-                throw new WorkflowException(
-                    `networkAccess must be a boolean, got: ${networkaccess_eval!r}.`
-                )
-            }
-            j.networkaccess = networkaccess_eval;
+    let networkaccess_field = networkaccess["networkAccess"];
+    if (typeof networkaccess_field === "string") {
+        let networkaccess_eval = builder.do_eval(networkaccess_field);
+        if (typeof networkaccess_eval !== "boolean") {
+            throw new WorkflowException(
+                `'networkAccess' expression must evaluate to a bool. 
+                Got ${networkaccess_eval} for expression ${networkaccess_field}.`
+            )
+        } else {
+            let networkaccess_eval = networkaccess_field;
         }
+        if (typeof networkaccess_eval !== "boolean") {
+            throw new WorkflowException(
+                `networkAccess must be a boolean, got: ${networkaccess_eval}.`
+            )
+        }
+        j.networkaccess = networkaccess_eval;
     }
 }
 handle_env_var(builder: Builder, debug: boolean): any {
-    let evr;
-    [evr, _] = this.get_requirement("EnvVarRequirement");
-    if (evr === null) {
+    let [evr, _] = this.get_requirement("EnvVarRequirement");
+    if (evr === undefined) {
         return {};
     }
     let required_env = {};
-    for (let eindex = 0; eindex < evr["envDef"].length; eindex++) {
-        let t3 = evr["envDef"][eindex];
+    const envDef = evr["envDef"] as CWLObjectType[]
+    for (let eindex = 0; eindex < envDef.length; eindex++) {
+        let t3 = envDef[eindex];
         let env_value_field = t3["envValue"];
-        if (env_value_field.includes("${") || env_value_field.includes("$(")) {
+        let env_value : string | undefined = undefined
+        if (isString(env_value_field) &&( env_value_field.includes("${") || env_value_field.includes("$("))) {
             let env_value_eval = builder.do_eval(env_value_field);
             if (typeof env_value_eval !== 'string') {
-                throw new SourceLine(evr["envDef"], eindex, WorkflowException, debug).makeError(
+                throw new WorkflowException(
                     "'envValue expression must evaluate to a str. " + 
                     `Got ${env_value_eval} for expression ${env_value_field}.`
                 );
             }
             env_value = env_value_eval;
         } else {
-            env_value = env_value_field;
+            env_value = env_value_field as string;
         }
-        required_env[t3["envName"]] = env_value;
+        required_env[t3["envName"] as string] = env_value;
     }
     return required_env;
-        }
     }
     setup_command_line(builder: Builder, j: JobBase, debug: boolean) {
-        let shellcmd;
-        [shellcmd, _] = this.get_requirement("ShellCommandRequirement");
+        const [shellcmd, _] = this.get_requirement("ShellCommandRequirement");
         if (shellcmd !== null) {
-            let cmd = [];  // type: List[str]
+            let cmd:string[] = [];  // type: List[str]
             for (let b of builder.bindings) {
                 let arg = builder.generate_arg(b);
                 if (b.get("shellQuote", true)) {
-                    arg = [shellescape.quote(a) for a in aslist(arg)];
+                    arg = aslist(arg).map(a=>quote(a));
                 }
                 cmd = [...cmd, ...aslist(arg)];
             }
             j.command_line = ["/bin/sh", "-c", cmd.join(" ")];
         } else {
-            j.command_line = flatten(builder.bindings.map(binding => builder.generate_arg(binding)));
+            const cmd = builder.bindings.map(binding => builder.generate_arg(binding)).flat()
+            j.command_line = cmd;
         }
     }
 
     handle_mpi_require(runtimeContext: RuntimeContext, builder: Builder, j: JobBase, debug: boolean) {
-        let mpi;
-        [mpi, _] = this.get_requirement(MPIRequirementName);
+        // TODO mpi not implemented
+        // let mpi;
+        // [mpi, _] = this.get_requirement(MPIRequirementName);
 
-        if (mpi === null) {
-            return;
-        }
+        // if (mpi === null) {
+        //     return;
+        // }
 
-        let np = mpi.get("processes", runtimeContext.mpi_config.default_nproc);
-        if (typeof np === 'string') {
-            let np_eval = builder.do_eval(np);
-            if (typeof np_eval !== 'number') {
-                throw new SourceLine(mpi, "processes", WorkflowException, debug).makeError(
-                `${MPIRequirementName} needs 'processes' expression to ` +
-                `evaluate to an int, got ${np_eval} for expression ${np}.`
-                );
-            }
-            np = np_eval;
-        }
-        j.mpi_procs = np;
+        // let np = mpi.get("processes", runtimeContext.mpi_config.default_nproc);
+        // if (typeof np === 'string') {
+        //     let np_eval = builder.do_eval(np);
+        //     if (typeof np_eval !== 'number') {
+        //         throw new SourceLine(mpi, "processes", WorkflowException, debug).makeError(
+        //         `${MPIRequirementName} needs 'processes' expression to ` +
+        //         `evaluate to an int, got ${np_eval} for expression ${np}.`
+        //         );
+        //     }
+        //     np = np_eval;
+        // }
+        // j.mpi_procs = np;
     }
     setup_std_io(builder: any, j: any, reffiles: any[], debug: boolean): void {
-        if(this.tool.get("stdin")) {
+        if(this.tool.stdin) {
             const stdin_eval = builder.do_eval(this.tool["stdin"]);
             if(!(typeof stdin_eval === 'string' || stdin_eval === null)) {
                 throw new Error(
@@ -917,8 +913,8 @@ handle_env_var(builder: Builder, debug: boolean): any {
             }
         }
 
-        if(this.tool.get("stderr")) {
-            const stderr_eval = builder.do_eval(this.tool["stderr"]);
+        if(this.tool.stderr) {
+            const stderr_eval = builder.do_eval(this.tool.stderr);
             if(typeof stderr_eval !== 'string') {
                 throw new Error(
                     `'stderr' expression must return a string. Got ${stderr_eval} for ${this.tool['stderr']}.`
@@ -934,8 +930,8 @@ handle_env_var(builder: Builder, debug: boolean): any {
             }
         }
 
-        if(this.tool.get("stdout")) {
-            const stdout_eval = builder.do_eval(this.tool["stdout"]);
+        if(this.tool.stdout) {
+            const stdout_eval = builder.do_eval(this.tool.stdout);
             if(typeof stdout_eval !== 'string') {
                 throw new Error(
                     `'stdout' expression must return a string. Got ${stdout_eval} for ${this.tool['stdout']}.`
@@ -954,40 +950,40 @@ handle_env_var(builder: Builder, debug: boolean): any {
     handleMutationManager(builder: Builder, j: JobBase): Record<string, CWLObjectType> | undefined {
         let readers: Record<string, CWLObjectType> = {};
         let muts: Set<string> = new Set();
+        // TODO MutationManager is not implemented
+        // if (builder.mutationManager === null) {
+        //     return readers;
+        // }
 
-        if (builder.mutationManager === null) {
-            return readers;
-        }
+        // let registerMut = (f: CWLObjectType) => {
+        //     let mm = builder.mutationManager as MutationManager;
+        //     muts.add(f['location'] as string);
+        //     mm.registerMutation(j.name, f);
+        // }
 
-        let registerMut = (f: CWLObjectType) => {
-            let mm = builder.mutationManager as MutationManager;
-            muts.add(f['location'] as string);
-            mm.registerMutation(j.name, f);
-        }
+        // let registerReader = (f: CWLObjectType) => {
+        //     let mm = builder.mutationManager as MutationManager;
+        //     if (!muts.has(f['location'] as string)) {
+        //         mm.registerReader(j.name, f);
+        //         readers[f['location'] as string] = JSON.parse(JSON.stringify(f));
+        //     }
+        // }
 
-        let registerReader = (f: CWLObjectType) => {
-            let mm = builder.mutationManager as MutationManager;
-            if (!muts.has(f['location'] as string)) {
-                mm.registerReader(j.name, f);
-                readers[f['location'] as string] = JSON.parse(JSON.stringify(f));
-            }
-        }
-
-        for (let li of j.generatefiles['listing']) {
-            if (li.get('writable') && j.inplaceUpdate) {
-                adjustFileObjs(li, registerMut)
-                adjustDirObjs(li, registerMut)
-            } else {
-                adjustFileObjs(li, registerReader)
-                adjustDirObjs(li, registerReader)
-            }
-        }
+        // for (let li of j.generatefiles['listing']) {
+        //     if (li.get('writable') && j.inplaceUpdate) {
+        //         adjustFileObjs(li, registerMut)
+        //         adjustDirObjs(li, registerMut)
+        //     } else {
+        //         adjustFileObjs(li, registerReader)
+        //         adjustDirObjs(li, registerReader)
+        //     }
+        // }
         
 
-        adjustFileObjs(builder.files, registerReader);
-        adjustFileObjs(builder.bindings, registerReader);
-        adjustDirObjs(builder.files, registerReader);
-        adjustDirObjs(builder.bindings, registerReader);
+        // adjustFileObjs(builder.files, registerReader);
+        // adjustFileObjs(builder.bindings, registerReader);
+        // adjustDirObjs(builder.files, registerReader);
+        // adjustDirObjs(builder.bindings, registerReader);
         
         return readers;
     }
@@ -997,7 +993,7 @@ handle_env_var(builder: Builder, debug: boolean): any {
         output_callbacks: OutputCallbackType | null,
         runtimeContext: RuntimeContext
     ): Generator<JobBase | CallbackJob, void, unknown> {
-        const [workReuse, _] = this.get_requirement("WorkReuse");
+        const [workReuse, ] = this.get_requirement("WorkReuse");
         const enableReuse = workReuse ? workReuse.get("enableReuse", true) : true;
 
         const jobname = uniquename(runtimeContext.name || shortname(this.tool.get("id", "job")));
@@ -1026,7 +1022,7 @@ handle_env_var(builder: Builder, debug: boolean): any {
         j.temporaryFailCodes = this.tool.get("temporaryFailCodes", []);
         j.permanentFailCodes = this.tool.get("permanentFailCodes", []);
 
-        const debug = _logger.isEnabledFor(LogLevel.DEBUG);
+        const debug = _logger.isDebugEnabled()
 
         if (debug) {
             _logger.debug(
@@ -1040,7 +1036,7 @@ handle_env_var(builder: Builder, debug: boolean): any {
         builder.pathmapper = this.make_path_mapper(reffiles, builder.stagedir, runtimeContext, true);
         builder.requirements = j.requirements;
 
-        const _check_adjust = _check_adjust_partial(check_adjust, this.path_check_mode.value, builder);
+        const _check_adjust = (val) =>checkAdjust(this.path_check_mode.value, builder,val);
 
         visit_class([builder.files, builder.bindings], ["File", "Directory"], _check_adjust);
 
@@ -1067,11 +1063,11 @@ handle_env_var(builder: Builder, debug: boolean): any {
             );
         }
 
-        const [dockerReq, _] = this.get_requirement("DockerRequirement");
+        const [dockerReq, ] = this.get_requirement("DockerRequirement");
         if (dockerReq && runtimeContext.use_container) {
-            j.outdir = runtimeContext.get_outdir();
-            j.tmpdir = runtimeContext.get_tmpdir();
-            j.stagedir = runtimeContext.create_tmpdir();
+            j.outdir = runtimeContext.getOutdir();
+            j.tmpdir = runtimeContext.getTmpdir();
+            j.stagedir = runtimeContext.createTmpdir();
         } else {
             j.outdir = builder.outdir;
             j.tmpdir = builder.tmpdir;
@@ -1095,31 +1091,31 @@ handle_env_var(builder: Builder, debug: boolean): any {
         this.setup_command_line(builder, j, debug);
 
         j.pathmapper = builder.pathmapper;
-        j.collect_outputs = partial(
-            this.collect_output_ports,
+        j.collect_outputs =(val)=>
+            this.collect_output_ports(
             this.tool["outputs"],
             builder,
-            getdefault(runtimeContext.compute_checksum, true),
+            getDefault(runtimeContext.compute_checksum, true),
             jobname,
             readers,
-        );
+            val)
         j.output_callback = output_callbacks;
 
         this.handle_mpi_require(runtimeContext,builder,j ,debug);
         yield j;
     }
     collect_output_ports(
-        ports: CommentedSeq | Set<CWLObjectType>,
+        ports: {} | Set<CWLObjectType>,
         builder: Builder,
         outdir: string,
         rcode: number,
         compute_checksum: boolean = true,
         jobname: string = "",
-        readers: MutableMapping<string, CWLObjectType> | null = null,
+        readers: MutableMapping<CWLObjectType> | null = null,
     ): OutputPortsType {
         let ret: OutputPortsType = {};
-        const debug = _logger.isEnabledFor(LogLevel.DEBUG);
-        const cwl_version = this.metadata.get(ORIGINAL_CWLVERSION, null);
+        const debug = _logger.isDebugEnabled()
+        const cwl_version:string = "v1.2"
         if (cwl_version != "v1.0") {
             builder.resources["exitCode"] = rcode;
         }
@@ -1135,41 +1131,41 @@ handle_env_var(builder: Builder, debug: boolean): any {
                     );
                 }
             } else {
-                for (let i = 0; i < ports.length; i++) {
-                    let port = ports[i];
-                    const fragment = shortname(port["id"]);
-                    ret[fragment] = this.collect_output(
-                        port,
-                        builder,
-                        outdir,
-                        fs_access,
-                        compute_checksum,
-                    );
-                }
+                // for (let i = 0; i < ports.length; i++) {
+                //     let port = ports[i];
+                //     const fragment = shortname(port["id"]);
+                //     ret[fragment] = this.collect_output(
+                //         port,
+                //         builder,
+                //         outdir,
+                //         fs_access,
+                //         compute_checksum,
+                //     );
+                // }
             }
             if (ret) {
-                const revmap = partial(revmap_file, builder, outdir); 
-                adjustDirObjs(ret, trim_listing);
-                visit_class(ret, ("File", "Directory"), revmap);
-                visit_class(ret, ("File", "Directory"), remove_path);
+                const revmap = (val)=>revmap_file(builder, outdir,val); 
+                // adjustDirObjs(ret, trim_listing);
+                visit_class(ret, ["File", "Directory"], revmap);
+                visit_class(ret, ["File", "Directory"], remove_path);
                 normalizeFilesDirs(ret);
                 visit_class(
                     ret,
-                    ("File", "Directory"),
-                    partial(check_valid_locations, fs_access),
+                    ["File", "Directory"],
+                    (val)=>checkValidLocations(fs_access,val),
                 );
 
                 if (compute_checksum) {
-                    adjustFileObjs(ret, partial(compute_checksums, fs_access));
+                    adjustFileObjs(ret, (val)=>compute_checksums(fs_access,val));
                 }
-                const expected_schema = ((this.names.get_name("outputs_record_schema", null)) as Schema);
-                validate_ex(
-                    expected_schema,
-                    ret,
-                    false,
-                    _logger_validation_warnings,
-                    INPUT_OBJ_VOCAB,
-                );
+                // const expected_schema = ((this.names.get_name("outputs_record_schema", null)) as Schema);
+                // validate_ex(
+                //     expected_schema,
+                //     ret,
+                //     false,
+                //     _logger_validation_warnings,
+                //     INPUT_OBJ_VOCAB,
+                // );
                 if (ret && builder.mutation_manager) {
                     adjustFileObjs(ret, builder.mutation_manager.set_generation);
                 }
@@ -1191,9 +1187,10 @@ handle_env_var(builder: Builder, debug: boolean): any {
                 }
             }
         }
+        return ret
     }
-    glob_output(builder: Builder, binding, debug: boolean, outdir: string,
-    fs_access: StdFsAccess, compute_checksum: boolean, revmap): [Array<CWLOutputType>, Array<string>] {
+    async glob_output(builder: Builder, binding, debug: boolean, outdir: string,
+    fs_access: StdFsAccess, compute_checksum: boolean, revmap): Promise<[CWLOutputType[], string[]]> {
         let r: Array<CWLOutputType> = [];
         let globpatterns: Array<string> = [];
 
@@ -1240,33 +1237,29 @@ handle_env_var(builder: Builder, debug: boolean): any {
 
                 try {
                     let prefix = fs_access.glob(outdir);
-                    let sorted_glob_result = fs_access.glob(fs_access.join(outdir, gb)).sort(locale.strcoll);
+                    let sorted_glob_result = fs_access.glob(fs_access.join(outdir, gb)).sort();
 
                     r.push(
-                        ...sorted_glob_result.map((g, decoded_basename) => ({
+                        ...sorted_glob_result.map((g) => ({
                             "location": g,
                             "path": fs_access.join(
                                 builder.outdir,
-                                urllib.parse.unquote(g.substring(prefix[0].length + 1)),
+                                decodeURIComponent(g.substring(prefix[0].length + 1)),
                             ),
-                            "basename": decoded_basename,
-                            "nameroot": os.path.splitext(decoded_basename)[0],
-                            "nameext": os.path.splitext(decoded_basename)[1],
+                            "basename": g,
+                            "nameroot": splitext(g)[0],
+                            "nameext": splitext(g)[1],
                             "class": fs_access.isfile(g) ? "File" : "Directory"
                         })
                     ));
                 } catch (e) {
-                    if (e instanceof OSError) {
-                        console.warn(e.toString());
-                    } else {
-                        console.error("Unexpected error from fs_access");
-                        throw e;
-                    }
+                    console.error("Unexpected error from fs_access");
+                    throw e;
                 }
             }
 
-            for (let files of cast<Array<Dictionary<string, Optional<CWLOutputType>>>, r>) {
-                let rfile = { ...files };
+            for (let files of r) {
+                let rfile = { ...files as any };
                 revmap(rfile);
                 if (files["class"] === "Directory") {
                     let ll = binding["loadListing"] || builder.loadListing;
@@ -1275,68 +1268,52 @@ handle_env_var(builder: Builder, debug: boolean): any {
                     }
                 } else {
                     if (binding["loadContents"]) {
+                        let f:any = undefined
                         try {
-                            let f = fs_access.open(cast<string>(rfile["location"]), "rb");
-                            files["contents"] = content_limit_respected_read_bytes(f).toString("utf-8");
+                            f = fs_access.open(rfile["location"] as string, "rb");
+                            files["contents"] = contentLimitRespectedRead(f)
                         } finally {
-                            f.close();
+                            if(f){
+                                f.close();
+                            }
                         }
                     }
 
                     if (compute_checksum) {
-                        try {
-                            let checksum = crypto.createHash('sha1'); // nosec
-                            let f = fs_access.open(cast<string>(rfile["location"]), "rb");
-                            let contents = f.read(1024 * 1024);
-                            while (contents.length !== 0) {
-                                checksum.update(contents);
-                                contents = f.read(1024 * 1024);
-                            }
-                            files["checksum"] = "sha1$" + checksum.digest("hex");
-                        } finally {
-                            f.close();
-                        }
+                        await compute_checksums(fs_access,rfile)
                     }
 
-                    files["size"] = fs_access.size(cast<string>(rfile["location"]));
+                    files["size"] = fs_access.size(rfile["location"] as string);
                 }
             }
 
             return [r, globpatterns];
         } catch (e) {
-            SourceLine(binding, "glob", WorkflowException, debug);
             throw e;
         }
+        throw new Error("unexpected path")
     }
     collect_secondary_files(schema: CWLObjectType,builder:Builder,result: CWLOutputType | null,debug:boolean,
         fs_access: StdFsAccess,revmap: any): void {
-        with (new SourceLine(schema, "secondaryFiles", WorkflowException, debug)) {
             for (let primary of aslist(result)) {
-                if (primary instanceof MutableMapping) {
+                if (primary instanceof Object) {
                     if (!primary["secondaryFiles"]) {
                         primary["secondaryFiles"] = [];
                     }
-                    let pathprefix = primary["path"].substring(0, primary["path"].lastIndexOf(os.sep) + 1);
+                    let pathprefix = primary["path"].substring(0, primary["path"].lastIndexOf(path.sep) + 1);
                     for (let sf of aslist(schema["secondaryFiles"])) {
                         let sf_required: boolean;
                         if ("required" in sf) {
-                            with (new SourceLine(
-                                schema["secondaryFiles"],
-                                "required",
-                                WorkflowException,
-                                debug,
-                            )) {
-                                let sf_required_eval = builder.do_eval(
-                                    sf["required"], primary
+                            let sf_required_eval = builder.do_eval(
+                                sf["required"], primary
+                            );
+                            if (!(typeof sf_required_eval === 'boolean' ||
+                                sf_required_eval === null)) {
+                                throw new WorkflowException(
+                                    `Expressions in the field 'required' must evaluate to a Boolean (true or false) or None. Got ${sf_required_eval} for ${sf['required']}.`
                                 );
-                                if (!(typeof sf_required_eval === 'boolean' ||
-                                    sf_required_eval === null)) {
-                                    throw new WorkflowException(
-                                        `Expressions in the field 'required' must evaluate to a Boolean (true or false) or None. Got ${sf_required_eval} for ${sf['required']}.`
-                                    );
-                                }
-                                sf_required = sf_required_eval || false;
                             }
+                            sf_required = sf_required_eval as boolean || false;
                         } else {
                             sf_required = false;
                         }
@@ -1356,11 +1333,7 @@ handle_env_var(builder: Builder, debug: boolean): any {
                                 sfitem = {"path": pathprefix + sfitem};
                             }
                             let original_sfitem = JSON.parse(JSON.stringify(sfitem));
-                            if (!fs_access.exists(
-                                cast(
-                                    String, cast(CWLObjectType, revmap(sfitem))["location"]
-                                )
-                            ) && sf_required) {
+                            if (!fs_access.exists(revmap(sfitem)["location"])&& sf_required) {
                                 throw new WorkflowException(
                                     `Missing required secondary file '${original_sfitem["path"]}'`
                                 );
@@ -1380,7 +1353,6 @@ handle_env_var(builder: Builder, debug: boolean): any {
                 }
             }
         }
-    }
     handle_output_format(schema: CWLObjectType, builder: Builder, result: CWLObjectType, debug: boolean): void {
         if ("format" in schema) {
             const format_field: string = <string>schema["format"];
@@ -1392,7 +1364,7 @@ handle_env_var(builder: Builder, debug: boolean): any {
                         if (Array.isArray(result)) {
                             message += ` 'self' had the value of the index ${index} result: ${primary}.`;
                         }
-                        throw SourceLine(schema, "format", WorkflowException, debug).makeError(message);
+                        throw new WorkflowException(message);
                     }
                     primary["format"] = format_eval;
                 });
@@ -1403,20 +1375,20 @@ handle_env_var(builder: Builder, debug: boolean): any {
             }
         }
     }
-    collect_output(
+    async collect_output(
     schema: CWLObjectType,
     builder: Builder,
     outdir: string,
     fs_access: StdFsAccess,
     compute_checksum: boolean = true,
-    ): CWLOutputType | undefined {
+    ): Promise<CWLOutputType | undefined> {
     let empty_and_optional: boolean = false;
-    let debug = _logger.isEnabledFor(logging.DEBUG);
+    let debug = _logger.isDebugEnabled()
     let result: CWLOutputType | undefined = undefined;
     if (schema.hasOwnProperty("outputBinding")) {
-        let binding: MutableMapping<string, boolean | string | string[]> = <MutableMapping<string, boolean | string | string[]>>schema["outputBinding"];
+        let binding = schema["outputBinding"] as Object;
         let revmap = revmap_file.bind(null, builder, outdir);
-        let [r, globpatterns] = this.glob_output(builder, binding, debug, outdir, fs_access, compute_checksum, revmap);
+        let [r, globpatterns] = await this.glob_output(builder, binding, debug, outdir, fs_access, compute_checksum, revmap);
         let optional: boolean = false;
         let single: boolean = false;
         if (Array.isArray(schema["type"])) {
@@ -1429,15 +1401,16 @@ handle_env_var(builder: Builder, debug: boolean): any {
         } else if (schema["type"] === "File" || schema["type"] === "Directory") {
         single = true;
         }
+        let result 
         if (binding.hasOwnProperty("outputEval")) {
-        try {
-            result = builder.do_eval(<CWLOutputType>binding["outputEval"], { context: r });
-        } 
-        catch (error) {
-            // Log the error here
-        }
+            try {
+                result = builder.do_eval(<CWLOutputType>binding["outputEval"], { context: r });
+            } 
+            catch (error) {
+                // Log the error here
+            }
         } else {
-        result = <CWLOutputType>r;
+            result = <CWLOutputType>r;
         }
         if (single) {
         try {
